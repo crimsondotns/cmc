@@ -170,11 +170,11 @@ def process_dex_url(url):
     ]
     return result
 
-def process_currency_url(url):
+def process_currency_url(url, sheet_address=''):
     ts = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
     slug = get_slug_from_url(url)
     if not slug:
-        return ["Invalid URL"] + [""] * 24 + [ts]
+        return ["Invalid URL"] + [""] * 25 + [ts]
 
     headers = {'User-Agent': 'Mozilla/5.0'}
     
@@ -184,17 +184,18 @@ def process_currency_url(url):
         detail = detail_res.get('data', {})
         
         if not detail:
-            return ["Not Found API"] + [""] * 24 + [ts]
+            return ["Not Found API"] + [""] * 25 + [ts]
 
         cid = detail.get('id', '')
         name = detail.get('name', '')
         symbol = detail.get('symbol', '')
         date_added = detail.get('dateAdded', '')
 
+        # Contract Address from ETC sheet Column C, Network from API
         platforms = detail.get('platforms', [])
-        if platforms:
-            address = platforms[0].get('contractAddress', '')
-            network = platforms[0].get('contractPlatform', '')
+        if sheet_address:
+            address = sheet_address
+            network = platforms[0].get('contractPlatform', '') if platforms else symbol
         else:
             address = f"UCID={cid}"
             network = symbol
@@ -228,13 +229,13 @@ def process_currency_url(url):
 
         return [
             name, symbol, address, network, open_yesterday, high_yesterday, low_yesterday, close_yesterday, 
-            slug, tags_str, exchanges_str, *historical_data, ts, circulating_supply, total_supply, max_supply
+            slug, cid, tags_str, exchanges_str, *historical_data, ts, circulating_supply, total_supply, max_supply
         ]
 
     except Exception as e:
-        return [f"Error: {slug}"] + [""] * 24 + [ts]
+        return [f"Error: {slug}"] + [""] * 25 + [ts]
 
-def process_any_url(url, index, total):
+def process_any_url(url, index, total, sheet_address=''):
     ts = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
     try:
         current_time = datetime.now().strftime("%d %B %Y")
@@ -246,13 +247,13 @@ def process_any_url(url, index, total):
 
         if is_currency:
             time.sleep(0.5) 
-            return ('currency', process_currency_url(url))
+            return ('currency', process_currency_url(url, sheet_address))
         else:
             return ('dex', process_dex_url(url))
             
     except Exception as e:
         if "/currencies/" in url:
-            return ('currency', [f"SysError: {str(e)}"] + [""] * 24 + [ts])
+            return ('currency', [f"SysError: {str(e)}"] + [""] * 25 + [ts])
         else:
             return ('dex', [f"SysError: {str(e)}"] + [""] * 13 + [ts])
 
@@ -261,8 +262,9 @@ def get_untracked_row(item, pro_api_status):
     slug = item.get('slug', '')
     slug_lower = slug.lower() if slug else ''
     
+    # 🚨 กรองข้อมูลที่ไม่มี Slug ทิ้ง ไม่นำไปใช้ต่อ 🚨
     if not slug:
-        return None  # ถูกกรองทิ้งแล้ว แต่ใส่กันเหนียวไว้
+        return None 
         
     headers = {'User-Agent': 'Mozilla/5.0'}
     categories = item.get('tags', '')
@@ -273,7 +275,6 @@ def get_untracked_row(item, pro_api_status):
     is_active = 0
     
     try:
-        # 1. Fallback API หลังบ้าน
         if not categories or slug_lower not in pro_api_status or circulating_supply == '':
             detail_url = f"https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug={slug}"
             detail_res = requests.get(detail_url, headers=headers, timeout=10)
@@ -300,7 +301,6 @@ def get_untracked_row(item, pro_api_status):
                 if total_supply == '': total_supply = stats.get('totalSupply', '')
                 if max_supply == '': max_supply = stats.get('maxSupply', '')
 
-        # 2. ถ้ามีข้อมูลจาก PRO API ให้ยึด Pro API เป็นหลัก
         if slug_lower in pro_api_status:
             is_active = pro_api_status[slug_lower]
             
@@ -331,6 +331,7 @@ def get_untracked_row(item, pro_api_status):
         categories,         
         exchanges,          
         slug,               
+        item.get('cid', ''),
         circulating_supply, 
         total_supply,       
         max_supply,         
@@ -368,8 +369,9 @@ def run_update_cycle():
         client = gspread.authorize(credentials)
 
         sheet = client.open_by_key("1fQGFO2fmf8wde6Sn9FeCrQK_9ehUujA7REoGBolCImA")
-        worksheet = sheet.worksheet("ETC") # ยังคงอ่านลิงก์จาก ETC
+        worksheet = sheet.worksheet("ETC")
         urls = worksheet.get("D2:D")
+        addresses = worksheet.get("C2:C")
 
         if not urls:
             print(f"{current_date} : ⚠️ No URLs found")
@@ -379,13 +381,14 @@ def run_update_cycle():
         print(f"{current_date} : 🔗 Found {total_urls} URLs total")
 
         dex_results = [[""] * 14 for _ in range(total_urls)]
-        currency_results = [[""] * 25 for _ in range(total_urls)]
+        currency_results = [[""] * 26 for _ in range(total_urls)]
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
             futures = {}
             for i, url in enumerate(urls):
                 if url and len(url) > 0 and url[0].strip():
-                    future = executor.submit(process_any_url, url[0].strip(), i+1, total_urls)
+                    sheet_addr = addresses[i][0].strip() if i < len(addresses) and addresses[i] and len(addresses[i]) > 0 else ''
+                    future = executor.submit(process_any_url, url[0].strip(), i+1, total_urls, sheet_addr)
                     futures[future] = i 
 
             for future in concurrent.futures.as_completed(futures):
@@ -400,7 +403,7 @@ def run_update_cycle():
         packed_dex = [row for row in dex_results if any(cell != "" for cell in row)]
         packed_currency = [row for row in currency_results if any(cell != "" for cell in row)]
 
-        packed_currency_write = [row[:22] for row in packed_currency]
+        packed_currency_write = [row[:23] for row in packed_currency]
 
         dest_sheet = client.open_by_key("1S3KXq6QdTep3RvR97LhURQ8sZzvTaVN1RJVxeWj3IXc")
 
@@ -415,7 +418,7 @@ def run_update_cycle():
             try:
                 dest_ws_main = dest_sheet.worksheet("MAIN")
             except:
-                dest_ws_main = dest_sheet.add_worksheet(title="MAIN", rows="1000", cols="25")
+                dest_ws_main = dest_sheet.add_worksheet(title="MAIN", rows="1000", cols="26")
             print(f"{current_date} : 🧹 Clearing old data in [MAIN]...")
             dest_ws_main.batch_clear(["A2:Z"])
             print(f"{current_date} : ✍️ Writing {len(packed_currency_write)} rows to [MAIN]...")
@@ -429,23 +432,21 @@ def run_update_cycle():
         all_items = []
         for row in packed_dex:
             slug = row[6]
-            # 🚨 กรองเอาเฉพาะตัวที่มี Slug เท่านั้น 🚨
             if slug and str(slug).strip() != "":
                 all_items.append({
                     "name": row[0], "symbol": row[1], "address": row[2], 
-                    "network": row[3], "slug": slug, 
+                    "network": row[3], "slug": slug, "cid": row[8] if len(row) > 8 else '',
                     "circulating_supply": row[11], "total_supply": row[12], "max_supply": row[13],
                     "type": "dex"
                 })
         for row in packed_currency:
             slug = row[8]
-            # 🚨 กรองเอาเฉพาะตัวที่มี Slug เท่านั้น 🚨
             if slug and str(slug).strip() != "":
                 all_items.append({
                     "name": row[0], "symbol": row[1], "address": row[2], 
-                    "network": row[3], "slug": slug, 
-                    "tags": row[9], "exchanges": row[10], 
-                    "circulating_supply": row[22], "total_supply": row[23], "max_supply": row[24],
+                    "network": row[3], "slug": slug, "cid": row[9],
+                    "tags": row[10], "exchanges": row[11], 
+                    "circulating_supply": row[23], "total_supply": row[24], "max_supply": row[25],
                     "type": "currency"
                 })
 
@@ -476,7 +477,7 @@ def run_update_cycle():
             futures = [executor.submit(get_untracked_row, item, pro_api_status) for item in all_items]
             for future in futures:
                 result = future.result()
-                if result: # เช็กอีกรอบเพื่อความชัวร์ว่าไม่เป็น None
+                if result: 
                     untracked_results.append(result)
 
         if untracked_results:

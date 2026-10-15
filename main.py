@@ -1,26 +1,219 @@
 import os
 import json
 import re
+# pyrefly: ignore [missing-import]
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 import requests
 import concurrent.futures
+from dataclasses import dataclass, field, fields
+from typing import ClassVar
 from datetime import datetime
+from urllib.parse import urlparse
 import time
+# pyrefly: ignore [missing-import]
+import sys
 import traceback
-import math
 
-# เปิดการใช้งาน ANSI Colors บน Windows Terminal
-os.system('') 
+from reporting import report
 
+# ==========================================
+# ⚙️ Config
+# ==========================================
 MAX_THREADS = 7
 
 # 🔑 ใส่ API Key ของ CoinMarketCap Pro ที่นี่ (ถ้ามี)
-PRO_API_KEY = os.environ.get('CMC_PRO_API_KEY', '') 
+PRO_API_KEY = os.environ.get('CMC_PRO_API_KEY', '')
+
+# 📥 ชีตต้นทาง
+SOURCE_SHEET_ID = "1Yk2vMgJEQEidZ0D7EjQMZcRDXwaMghtTQhEMvsOCpsE"
+SOURCE_WORKSHEET = "CoinmarketCap"
+SOURCE_URL_RANGE = "I2:I"
+SOURCE_ADDRESS_RANGE = "G2:G"
+
+# 📤 ชีตปลายทาง
+DEST_SHEET_ID = "1S3KXq6QdTep3RvR97LhURQ8sZzvTaVN1RJVxeWj3IXc"
+DEST_MAIN_WORKSHEET = "CEX"
+DEST_UNTRACKED_WORKSHEET = "Untracked"
+
+HEADERS = {'User-Agent': 'Mozilla/5.0'}
+
+# ชื่อแถวเมื่อหน้าเว็บตอบ 404
+NOT_FOUND = "Not Found (404)"
+
+# ลองโหลดหน้า DEX ซ้ำกี่ครั้ง เมื่อได้หน้าที่ไม่มีข้อมูล token (มักเป็นหน้ากันบอท/โหลดไม่ครบ)
+SCRAPE_RETRIES = 3
+
+# จำนวนครั้งที่ยิง request เมื่อเจอ 429/5xx/timeout (404 และ 4xx อื่นไม่ retry)
+HTTP_RETRIES = 3
+
+# ถ้าแถว error เกินสัดส่วนนี้ จะไม่เขียนทับชีต (เก็บข้อมูลเดิมไว้) และจบด้วย exit 1
+MAX_ERROR_RATIO = 0.2
+
+# ==========================================
+# 📋 Row Models (ลำดับ field = ลำดับคอลัมน์ในชีต)
+# ==========================================
+@dataclass
+class SheetRow:
+    """แปลง dataclass เป็นแถวของชีต ตามลำดับการประกาศ field
+
+    - field ที่ metadata col=False ไม่ถูกเขียนลงชีต
+    - field ที่เป็น SheetRow ซ้อนอยู่ จะถูกกระจายเป็นหลายคอลัมน์
+    - หัวคอลัมน์มาจาก LABELS (ถ้าไม่มี ใช้ชื่อ field)
+    error: เหตุผลที่ดึงข้อมูลไม่สำเร็จ ใช้นับใน report
+    """
+    LABELS: ClassVar[dict] = {}
+
+    error: str = field(default="", repr=False, compare=False, metadata={'col': False})
+    # True = URL ในชีตใช้ไม่ได้ (404 / Not Found API / Invalid URL): ไม่เขียนลงชีต และไม่นับในเกณฑ์ error
+    bad_url: bool = field(default=False, repr=False, compare=False, metadata={'col': False})
+
+    @classmethod
+    def _columns(cls):
+        return [f for f in fields(cls) if f.metadata.get('col', True)]
+
+    @staticmethod
+    def _nested(f):
+        factory = f.default_factory
+        return factory if isinstance(factory, type) and issubclass(factory, SheetRow) else None
+
+    @classmethod
+    def headers(cls):
+        out = []
+        for f in cls._columns():
+            nested = cls._nested(f)
+            out.extend(nested.headers() if nested else [cls.LABELS.get(f.name, f.name)])
+        return out
+
+    def to_row(self):
+        out = []
+        for f in self._columns():
+            value = getattr(self, f.name)
+            out.extend(value.to_row() if isinstance(value, SheetRow) else [value])
+        return out
+
+    @classmethod
+    def failed(cls, reason, ts, label=None, bad_url=False):
+        """แถว error: ใส่ข้อความใน name และเวลาใน updated_at"""
+        return cls(name=label or reason, updated_at=ts, error=reason, bad_url=bad_url)
+
+
+@dataclass
+class OhlcSummary(SheetRow):
+    LABELS: ClassVar[dict] = {
+        'ath_open': "ATH Open", 'ath_high': "ATH High", 'ath_low': "ATH Low",
+        'ath_close': "ATH Close", 'ath_date': "ATH Date",
+        'atl_open': "ATL Open", 'atl_high': "ATL High", 'atl_low': "ATL Low",
+        'atl_close': "ATL Close", 'atl_date': "ATL Date",
+    }
+
+    ath_open: object = ""
+    ath_high: object = ""
+    ath_low: object = ""
+    ath_close: object = ""
+    ath_date: str = ""
+    atl_open: object = ""
+    atl_high: object = ""
+    atl_low: object = ""
+    atl_close: object = ""
+    atl_date: str = ""
+
+
+@dataclass
+class DexRow(SheetRow):
+    """ข้อมูลจากหน้า DEX (ไม่ได้เขียนลงชีต ใช้เป็นต้นทางของ Untracked)"""
+    name: str = ""
+    symbol: str = ""
+    address: str = ""
+    network: str = ""
+    high_24h: object = ""
+    low_24h: object = ""
+    slug: str = ""
+    lf: object = ""
+    cid: object = ""
+    holders_count: object = ""
+    updated_at: str = ""
+    circulating_supply: object = ""
+    total_supply: object = ""
+    max_supply: object = ""
+
+
+@dataclass
+class CurrencyRow(SheetRow):
+    """1 แถวของชีต CEX (supply ไม่ถูกเขียนลงชีต ใช้ส่งต่อให้ Untracked)"""
+    LABELS: ClassVar[dict] = {
+        'name': "Name", 'symbol': "Symbol", 'address': "Address", 'network': "Network",
+        'open_yesterday': "Open (เมื่อวาน)", 'high_yesterday': "High (เมื่อวาน)",
+        'low_yesterday': "Low (เมื่อวาน)", 'close_yesterday': "Close (เมื่อวาน)",
+        'slug': "Slug", 'cid': "CMC ID", 'tags': "Tags", 'exchanges': "Exchanges",
+        'updated_at': "Updated At",
+    }
+
+    name: str = ""
+    symbol: str = ""
+    address: str = ""
+    network: str = ""
+    open_yesterday: object = ""
+    high_yesterday: object = ""
+    low_yesterday: object = ""
+    close_yesterday: object = ""
+    slug: str = ""
+    cid: object = ""
+    tags: str = ""
+    exchanges: str = ""
+    ohlc: OhlcSummary = field(default_factory=OhlcSummary)
+    updated_at: str = ""
+    circulating_supply: object = field(default="", metadata={'col': False})
+    total_supply: object = field(default="", metadata={'col': False})
+    max_supply: object = field(default="", metadata={'col': False})
+
+
+@dataclass
+class UntrackedRow(SheetRow):
+    """1 แถวของชีต Untracked"""
+    LABELS: ClassVar[dict] = {
+        'name': "Name", 'symbol': "Symbol", 'address': "Address", 'network': "Network",
+        'categories': "Categories", 'exchanges': "Exchanges", 'slug': "Slug", 'cid': "CMC ID",
+        'circulating_supply': "Circulating Supply", 'total_supply': "Total Supply",
+        'max_supply': "Max Supply", 'is_active': "Active", 'updated_at': "Updated At",
+    }
+
+    name: str = ""
+    symbol: str = ""
+    address: str = ""
+    network: str = ""
+    categories: str = ""
+    exchanges: str = ""
+    slug: str = ""
+    cid: object = ""
+    circulating_supply: object = ""
+    total_supply: object = ""
+    max_supply: object = ""
+    is_active: bool = False
+    updated_at: str = ""
+
+    @classmethod
+    def from_source(cls, row):
+        """สร้างจาก DexRow หรือ CurrencyRow โดยคัดลอก field ที่ชื่อตรงกัน"""
+        return cls(
+            name=row.name,
+            symbol=row.symbol,
+            address=row.address,
+            network=row.network,
+            categories=getattr(row, 'tags', ''),
+            exchanges=getattr(row, 'exchanges', ''),
+            slug=row.slug,
+            cid=row.cid,
+            circulating_supply=row.circulating_supply,
+            total_supply=row.total_supply,
+            max_supply=row.max_supply,
+        )
 
 # ==========================================
 # 🛠️ Helper Functions
 # ==========================================
+def now_ts():
+    return datetime.now().strftime("%m/%d/%Y %H:%M:%S")
+
 def extract_value(text, regex):
     if not text:
         return None
@@ -36,6 +229,30 @@ def safe_float(val):
         return None if num == 0 else num
     except:
         return None
+
+def url_label(url):
+    """ชื่อสั้นของ URL สำหรับ log: currencies/<slug> -> slug, token/<chain>/<addr> -> chain/addr"""
+    parts = [p for p in urlparse(url).path.split('/') if p]
+    if len(parts) >= 2 and parts[0] == 'currencies':
+        return parts[1]
+    if len(parts) >= 3 and parts[0] == 'token':
+        return f"{parts[1]}/{parts[2]}"
+    return url.removeprefix('https://')
+
+def describe_page(res):
+    """สรุปหน้าเว็บที่ scrape ไม่ได้ สำหรับใส่ในข้อความ error"""
+    title = extract_value(res.text, r'<title[^>]*>(.*?)</title>') or '-'
+    return f"HTTP {res.status_code}, {len(res.content) // 1024}KB, title={title[:60]!r}"
+
+def not_found_reason(url):
+    """เหตุผลของ 404 พร้อมคำใบ้ถ้า address ดูผิดรูปแบบ"""
+    reason = "Not Found (404): CMC ไม่มีหน้านี้"
+    parts = [p for p in urlparse(url).path.split('/') if p]
+    if len(parts) >= 3 and parts[0] == 'token':
+        addr = parts[2]
+        if addr.startswith('0x') and '::' not in addr and len(addr) != 42:
+            return f"{reason} — address ยาว {len(addr)} ตัว (EVM ต้อง 42) ตรวจในชีต"
+    return f"{reason} — ตรวจ URL/address ในชีต"
 
 def get_slug_from_url(url):
     parts = [p for p in url.split('/') if p]
@@ -55,233 +272,263 @@ def format_short_date(iso_str):
     except:
         return iso_str.split('T')[0]
 
-def print_api_log(url, status_code):
-    """ฟังก์ชันสำหรับปริ้นท์ Log พร้อมใส่สี ANSI ตาม Status Code"""
-    ts = datetime.now().strftime("%d %b %y %H:%M")
-    path = url.split('.com')[-1] if '.com' in url else url
-    
-    # กำหนดสีตาม HTTP Status Code
-    if 200 <= status_code < 300:
-        color = '\033[92m'  # สีเขียว (Success)
-    elif 300 <= status_code < 400:
-        color = '\033[93m'  # สีเหลือง (Redirects)
-    else:
-        color = '\033[91m'  # สีแดง (Errors)
-        
-    reset = '\033[0m'       # คืนค่าสีเดิม
-    
-    print(f"{ts} | HTTP {color}{status_code}{reset} | {path}")
+def unique_exchange_names(market_pairs, limit=10):
+    names = []
+    for m in market_pairs:
+        ex_name = m.get('exchangeName')
+        if ex_name and ex_name not in names:
+            names.append(ex_name)
+    return ", ".join(names[:limit])
+
+def summarize_ohlc(quotes):
+    if not quotes:
+        return OhlcSummary()
+    ath = max(quotes, key=lambda q: q['quote']['close'])
+    atl = min(quotes, key=lambda q: q['quote']['close'])
+    return OhlcSummary(
+        ath_open=ath['quote']['open'],
+        ath_high=ath['quote']['high'],
+        ath_low=ath['quote']['low'],
+        ath_close=ath['quote']['close'],
+        ath_date=format_short_date(ath['timeClose']),
+        atl_open=atl['quote']['open'],
+        atl_high=atl['quote']['high'],
+        atl_low=atl['quote']['low'],
+        atl_close=atl['quote']['close'],
+        atl_date=format_short_date(atl['timeClose']),
+    )
+
+class HttpError(Exception):
+    pass
+
+def backoff(attempt):
+    time.sleep(2 ** attempt * 2)
+
+def http_get(url, headers=HEADERS, timeout=15):
+    """GET พร้อม retry เมื่อเจอ 429/5xx/timeout/เชื่อมต่อไม่ได้ (404 และ 4xx อื่นคืนทันที)"""
+    for attempt in range(HTTP_RETRIES):
+        last = attempt == HTTP_RETRIES - 1
+        try:
+            res = requests.get(url, headers=headers, timeout=timeout)
+        except requests.RequestException as e:
+            if last:
+                raise
+            report.warn(f"{type(e).__name__} retry {attempt + 1}/{HTTP_RETRIES - 1}: {urlparse(url).path}")
+            backoff(attempt)
+            continue
+        if res.status_code != 429 and res.status_code < 500 or last:
+            return res
+        report.warn(f"HTTP {res.status_code} retry {attempt + 1}/{HTTP_RETRIES - 1}: {urlparse(url).path}")
+        backoff(attempt)
+
+def get_data(url, timeout=15):
+    """เรียก JSON API ของ CMC แล้วคืนค่า data ({} ถ้าเป็น null) — status ไม่ใช่ 200 หรือไม่ใช่ JSON จะ raise HttpError"""
+    res = http_get(url, timeout=timeout)
+    path = urlparse(url).path
+    if res.status_code != 200:
+        raise HttpError(f"HTTP {res.status_code} {path}")
+    try:
+        body = res.json()
+    except ValueError:
+        raise HttpError(f"ไม่ใช่ JSON {path} ({describe_page(res)})")
+    return (body or {}).get('data') or {}
 
 def fetch_historical_ohlc(cid, date_added_str):
+    """คืน (OhlcSummary, error) — error ไม่ว่างถ้าดึงประวัติไม่ครบ (ไม่คำนวณ ATH/ATL จากข้อมูลบางส่วน)"""
     try:
-        if not date_added_str:
-            date_added_str = "2013-04-28T00:00:00.000Z" 
-            
-        start_ts = int(datetime.strptime(date_added_str, "%Y-%m-%dT%H:%M:%S.000Z").timestamp())
-        now_ts = int(time.time())
-        
+        date_added = (date_added_str or "2013-04-28T00:00:00.000Z").replace('Z', '+00:00')
+        start_ts = int(datetime.fromisoformat(date_added).timestamp())
+        end_ts = int(time.time())
+
         all_quotes = []
         current_start = start_ts
-        
-        while current_start < now_ts:
-            current_end = min(current_start + (365 * 86400), now_ts)
+
+        while current_start < end_ts:
+            current_end = min(current_start + (365 * 86400), end_ts)
             url = f"https://api.coinmarketcap.com/data-api/v3.1/cryptocurrency/historical?id={cid}&convertId=2781&timeStart={current_start}&timeEnd={current_end}&interval=1d"
-            
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            res = requests.get(url, headers=headers, timeout=15)
-            
-            data = res.json().get('data', {})
-            quotes = data.get('quotes', []) if data else []
-            
+            quotes = get_data(url).get('quotes') or []
+
             if not quotes:
                 break
-                
+
             all_quotes.extend(quotes)
             current_start = current_end + 1
-            time.sleep(0.3) 
+            time.sleep(0.3)
 
-        if not all_quotes:
-            return [""] * 10
-
-        ath_quote = max(all_quotes, key=lambda q: q['quote']['close'])
-        atl_quote = min(all_quotes, key=lambda q: q['quote']['close'])
-
-        return [
-            ath_quote['quote']['open'],
-            ath_quote['quote']['high'],
-            ath_quote['quote']['low'],
-            ath_quote['quote']['close'],
-            format_short_date(ath_quote['timeClose']), 
-            atl_quote['quote']['open'],
-            atl_quote['quote']['high'],
-            atl_quote['quote']['low'],
-            atl_quote['quote']['close'],
-            format_short_date(atl_quote['timeClose'])  
-        ]
+        return summarize_ohlc(all_quotes), ""
     except Exception as e:
-        return [""] * 10
+        return OhlcSummary(), f"ohlc: {type(e).__name__}: {e}"
 
 # ==========================================
 # 🌐 Processing Logic (DEX & Currencies & Untracked)
 # ==========================================
+def parse_dex_html(html, ts):
+    def text(regex):
+        return extract_value(html, regex) or ""
+
+    def number(regex):
+        value = safe_float(extract_value(html, regex))
+        return "" if value is None else value
+
+    row = DexRow(
+        name=text(r'"n":"(.*?)"'),
+        symbol=text(r'"sym":"(.*?)"'),
+        address=text(r'"addr":"(.*?)"'),
+        network=text(r'"pdex":"(.*?)"'),
+        high_24h=number(r'"ph24h":"(.*?)"'),
+        low_24h=number(r'"pl24h":"(.*?)"'),
+        slug=text(r'"cslug":"(.*?)"'),
+        lf=number(r'"lf":\s*(\d+)'),
+        cid=number(r'"cid":\s*(\d+)'),
+        holders_count=number(r'"holdersCount":\s*(\d+)'),
+        updated_at=ts,
+        circulating_supply=number(r'"circulatingSupply":\s*([0-9.]+)'),
+        total_supply=number(r'"totalSupply":\s*([0-9.]+)'),
+        max_supply=number(r'"maxSupply":\s*([0-9.]+)'),
+    )
+    if not row.name and not row.symbol:
+        return DexRow.failed("Scrape Failed", ts)
+    return row
+
 def process_dex_url(url):
-    ts = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    response = requests.get(url, headers=headers, timeout=15)
+    for attempt in range(SCRAPE_RETRIES):
+        ts = now_ts()
+        response = http_get(url)
 
-    if response.status_code == 404:
-        return ["Not Found (404)"] + [""] * 13 + [ts]
+        if response.status_code == 404:
+            return DexRow.failed(not_found_reason(url), ts, label=NOT_FOUND, bad_url=True)
+        if response.status_code != 200:
+            return DexRow.failed(f"HTTP {response.status_code} ({describe_page(response)})", ts,
+                                 label=f"HTTP {response.status_code}")
 
-    html = response.text
-    data = {
-        'n': extract_value(html, r'"n":"(.*?)"'),
-        'sym': extract_value(html, r'"sym":"(.*?)"'),
-        'addr': extract_value(html, r'"addr":"(.*?)"'),
-        'pdex': extract_value(html, r'"pdex":"(.*?)"'),
-        'ph24h': safe_float(extract_value(html, r'"ph24h":"(.*?)"')),
-        'pl24h': safe_float(extract_value(html, r'"pl24h":"(.*?)"')),
-        'cslug': extract_value(html, r'"cslug":"(.*?)"'),
-        'circulatingSupply': safe_float(extract_value(html, r'"circulatingSupply":\s*([0-9.]+)')),
-        'totalSupply': safe_float(extract_value(html, r'"totalSupply":\s*([0-9.]+)')),
-        'maxSupply': safe_float(extract_value(html, r'"maxSupply":\s*([0-9.]+)')),
-        'lf': safe_float(extract_value(html, r'"lf":\s*(\d+)')),
-        'cid': safe_float(extract_value(html, r'"cid":\s*(\d+)')),
-        'holdersCount': safe_float(extract_value(html, r'"holdersCount":\s*(\d+)')),
-    }
-    
-    if data['n'] is None and data['sym'] is None:
-         return ["Scrape Failed"] + [""] * 13 + [ts]
+        row = parse_dex_html(response.text, ts)
+        if not row.error:
+            return row
+        if attempt < SCRAPE_RETRIES - 1:
+            backoff(attempt)
 
-    result = [
-        data['n'] if data['n'] is not None else "",
-        data['sym'] if data['sym'] is not None else "",
-        data['addr'] if data['addr'] is not None else "",
-        data['pdex'] if data['pdex'] is not None else "",
-        data['ph24h'] if data['ph24h'] is not None else "",
-        data['pl24h'] if data['pl24h'] is not None else "",
-        data['cslug'] if data['cslug'] is not None else "",
-        data['lf'] if data['lf'] is not None else "",
-        data['cid'] if data['cid'] is not None else "",
-        data['holdersCount'] if data['holdersCount'] is not None else "",
-        ts,
-        data['circulatingSupply'] if data['circulatingSupply'] is not None else "",
-        data['totalSupply'] if data['totalSupply'] is not None else "",
-        data['maxSupply'] if data['maxSupply'] is not None else ""
-    ]
-    return result
+    row.error = f"Scrape Failed หลังลอง {SCRAPE_RETRIES} ครั้ง — ไม่พบชื่อ/symbol ในหน้า ({describe_page(response)})"
+    return row
+
+def build_currency_row(detail, slug, sheet_address, exchanges, ohlc, ts):
+    cid = detail.get('id', '')
+    symbol = detail.get('symbol', '')
+
+    # Contract Address from ETC sheet Column C, Network from API
+    platforms = detail.get('platforms') or []
+    if sheet_address:
+        address = sheet_address
+        network = platforms[0].get('contractPlatform', '') if platforms else symbol
+    else:
+        address = f"UCID={cid}"
+        network = symbol
+
+    stats = detail.get('statistics') or {}
+    return CurrencyRow(
+        name=detail.get('name', ''),
+        symbol=symbol,
+        address=address,
+        network=network,
+        open_yesterday=stats.get('openYesterday', ''),
+        high_yesterday=stats.get('highYesterday', ''),
+        low_yesterday=stats.get('lowYesterday', ''),
+        close_yesterday=stats.get('closeYesterday', ''),
+        slug=slug,
+        cid=cid,
+        tags=", ".join([t.get('name', '') for t in detail.get('tags') or []]),
+        exchanges=exchanges,
+        ohlc=ohlc,
+        updated_at=ts,
+        circulating_supply=stats.get('circulatingSupply', ''),
+        total_supply=stats.get('totalSupply', ''),
+        max_supply=stats.get('maxSupply', ''),
+    )
 
 def process_currency_url(url, sheet_address=''):
-    ts = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
+    ts = now_ts()
     slug = get_slug_from_url(url)
     if not slug:
-        return ["Invalid URL"] + [""] * 25 + [ts]
+        return CurrencyRow.failed("Invalid URL: หา slug จาก URL ไม่ได้", ts, label="Invalid URL", bad_url=True)
 
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    
     try:
         detail_url = f"https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug={slug}"
-        detail_res = requests.get(detail_url, headers=headers, timeout=15).json()
-        detail = detail_res.get('data', {})
-        
+        detail = get_data(detail_url)
+
         if not detail:
-            return ["Not Found API"] + [""] * 25 + [ts]
+            return CurrencyRow.failed("Not Found API: detail API ไม่มีข้อมูลของ slug นี้ — ตรวจ URL ในชีต", ts, label="Not Found API", bad_url=True)
 
-        cid = detail.get('id', '')
-        name = detail.get('name', '')
-        symbol = detail.get('symbol', '')
-        date_added = detail.get('dateAdded', '')
-
-        # Contract Address from ETC sheet Column C, Network from API
-        platforms = detail.get('platforms', [])
-        if sheet_address:
-            address = sheet_address
-            network = platforms[0].get('contractPlatform', '') if platforms else symbol
-        else:
-            address = f"UCID={cid}"
-            network = symbol
-
-        tags_list = detail.get('tags', [])
-        tags_str = ", ".join([t.get('name', '') for t in tags_list])
-
-        stats = detail.get('statistics', {})
-        
-        open_yesterday = stats.get('openYesterday', '')
-        high_yesterday = stats.get('highYesterday', '')
-        low_yesterday = stats.get('lowYesterday', '')
-        close_yesterday = stats.get('closeYesterday', '')
-        
-        circulating_supply = stats.get('circulatingSupply', '')
-        total_supply = stats.get('totalSupply', '')
-        max_supply = stats.get('maxSupply', '')
-
+        # ส่วนที่ดึงไม่สำเร็จ: ยังเขียนข้อมูลที่ได้ แต่นับแถวเป็น error
+        errors = []
         market_url = f"https://api.coinmarketcap.com/data-api/v3/cryptocurrency/market-pairs/latest?slug={slug}&start=1&limit=50&category=spot"
-        market_res = requests.get(market_url, headers=headers, timeout=15).json()
-        markets = market_res.get('data', {}).get('marketPairs', [])
-        
-        exchange_names = []
-        for m in markets:
-            ex_name = m.get('exchangeName')
-            if ex_name and ex_name not in exchange_names:
-                exchange_names.append(ex_name)
-        exchanges_str = ", ".join(exchange_names[:10])
+        try:
+            exchanges = unique_exchange_names(get_data(market_url).get('marketPairs') or [])
+        except Exception as e:
+            exchanges = ""
+            errors.append(f"market-pairs: {type(e).__name__}: {e}")
 
-        historical_data = fetch_historical_ohlc(cid, date_added)
+        ohlc, ohlc_error = fetch_historical_ohlc(detail.get('id', ''), detail.get('dateAdded', ''))
+        if ohlc_error:
+            errors.append(ohlc_error)
 
-        return [
-            name, symbol, address, network, open_yesterday, high_yesterday, low_yesterday, close_yesterday, 
-            slug, cid, tags_str, exchanges_str, *historical_data, ts, circulating_supply, total_supply, max_supply
-        ]
+        row = build_currency_row(detail, slug, sheet_address, exchanges, ohlc, ts)
+        row.error = "; ".join(errors)
+        return row
 
     except Exception as e:
-        return [f"Error: {slug}"] + [""] * 25 + [ts]
+        return CurrencyRow.failed(f"{type(e).__name__}: {e}", ts, label=f"Error: {slug}")
 
-def process_any_url(url, index, total, sheet_address=''):
-    ts = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
+def process_any_url(url, sheet_address=''):
+    is_currency = "/currencies/" in url
     try:
-        current_time = datetime.now().strftime("%d %B %Y")
-        percent = math.floor((index / total) * 100)
-        
-        is_currency = "/currencies/" in url
-        req_type = "API (MAIN)" if is_currency else "Scrape (DEX)"
-        print(f"{current_time} : ↻ [{req_type}] {percent}% : {url}")
-
         if is_currency:
-            time.sleep(0.5) 
-            return ('currency', process_currency_url(url, sheet_address))
+            time.sleep(0.5)
+            return process_currency_url(url, sheet_address)
         else:
-            return ('dex', process_dex_url(url))
-            
-    except Exception as e:
-        if "/currencies/" in url:
-            return ('currency', [f"SysError: {str(e)}"] + [""] * 25 + [ts])
-        else:
-            return ('dex', [f"SysError: {str(e)}"] + [""] * 13 + [ts])
+            return process_dex_url(url)
 
-def get_untracked_row(item, pro_api_status):
-    ts = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
-    slug = item.get('slug', '')
-    slug_lower = slug.lower() if slug else ''
-    
-    # 🚨 กรองข้อมูลที่ไม่มี Slug ทิ้ง ไม่นำไปใช้ต่อ 🚨
-    if not slug:
-        return None 
-        
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    categories = item.get('tags', '')
-    exchanges = item.get('exchanges', '')
-    circulating_supply = item.get('circulating_supply', '')
-    total_supply = item.get('total_supply', '')
-    max_supply = item.get('max_supply', '')
+    except Exception as e:
+        row_cls = CurrencyRow if is_currency else DexRow
+        return row_cls.failed(f"{type(e).__name__}: {e}", now_ts(), label=f"SysError: {str(e)}")
+
+def fetch_pro_api_status(slugs):
+    """คืน dict {slug: is_active} จาก CMC Pro API"""
+    status = {}
+    if not PRO_API_KEY or not slugs:
+        return status
+
+    for i in range(0, len(slugs), 50):
+        chunk = slugs[i:i + 50]
+        pro_url = f"https://pro-api.coinmarketcap.com/v3/cryptocurrency/quotes/latest?slug={','.join(chunk)}"
+        try:
+            res = http_get(pro_url, headers={'X-CMC_PRO_API_KEY': PRO_API_KEY})
+            if res.status_code != 200:
+                report.warn(f"Pro API HTTP {res.status_code} (slug ที่ {i + 1}-{i + len(chunk)})")
+                continue
+            data = (res.json() or {}).get('data') or {}
+            # รองรับทั้งแบบ dict {id: info | [info]} และแบบ list [info]
+            for info in (data.values() if isinstance(data, dict) else data):
+                for entry in (info if isinstance(info, list) else [info]):
+                    slug_key = (entry.get('slug') or '').lower()
+                    if slug_key:
+                        status[slug_key] = entry.get('is_active', 0)
+        except Exception as e:
+            report.warn(f"Pro API (slug ที่ {i + 1}-{i + len(chunk)}): {type(e).__name__}: {e}")
+    return status
+
+def get_untracked_row(source_row, pro_api_status):
+    if not source_row.slug:
+        return None
+
+    row = UntrackedRow.from_source(source_row)
+    row.updated_at = now_ts()
+    slug_lower = row.slug.lower()
     is_active = 0
-    
+
     try:
-        if not categories or slug_lower not in pro_api_status or circulating_supply == '':
-            detail_url = f"https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug={slug}"
-            detail_res = requests.get(detail_url, headers=headers, timeout=10)
-            print_api_log(detail_url, detail_res.status_code)
-            
-            detail_data = detail_res.json().get('data', {})
-            
+        if not row.categories or slug_lower not in pro_api_status or row.circulating_supply == '':
+            detail_url = f"https://api.coinmarketcap.com/data-api/v3/cryptocurrency/detail?slug={row.slug}"
+            detail_data = get_data(detail_url, timeout=10)
+
             if detail_data:
                 if slug_lower not in pro_api_status:
                     status_val = detail_data.get('status')
@@ -291,216 +538,175 @@ def get_untracked_row(item, pro_api_status):
                         is_active = 1 if status_val == 1 else 0
                     else:
                         is_active = detail_data.get('isActive', detail_data.get('is_active', 0))
-                
-                if not categories:
-                    tags_list = detail_data.get('tags', [])
-                    categories = ", ".join([t.get('name', '') for t in tags_list])
-                    
-                stats = detail_data.get('statistics', {})
-                if circulating_supply == '': circulating_supply = stats.get('circulatingSupply', '')
-                if total_supply == '': total_supply = stats.get('totalSupply', '')
-                if max_supply == '': max_supply = stats.get('maxSupply', '')
+
+                if not row.categories:
+                    row.categories = ", ".join([t.get('name', '') for t in detail_data.get('tags') or []])
+
+                stats = detail_data.get('statistics') or {}
+                if row.circulating_supply == '': row.circulating_supply = stats.get('circulatingSupply', '')
+                if row.total_supply == '': row.total_supply = stats.get('totalSupply', '')
+                if row.max_supply == '': row.max_supply = stats.get('maxSupply', '')
 
         if slug_lower in pro_api_status:
             is_active = pro_api_status[slug_lower]
-            
-        if not exchanges:
-            market_url = f"https://api.coinmarketcap.com/data-api/v3/cryptocurrency/market-pairs/latest?slug={slug}&start=1&limit=50&category=spot"
-            market_res = requests.get(market_url, headers=headers, timeout=10)
-            print_api_log(market_url, market_res.status_code)
-            
-            markets = market_res.json().get('data', {}).get('marketPairs', [])
-            
-            exchange_names = []
-            for m in markets:
-                ex_name = m.get('exchangeName')
-                if ex_name and ex_name not in exchange_names:
-                    exchange_names.append(ex_name)
-            exchanges = ", ".join(exchange_names[:10])
-            
+
+        if not row.exchanges:
+            market_url = f"https://api.coinmarketcap.com/data-api/v3/cryptocurrency/market-pairs/latest?slug={row.slug}&start=1&limit=50&category=spot"
+            row.exchanges = unique_exchange_names(get_data(market_url, timeout=10).get('marketPairs') or [])
+
     except Exception as e:
-        pass
-        
-    untracked_bool = True if is_active == 1 else False
-    
-    return [
-        item['name'],       
-        item['symbol'],     
-        item['address'],    
-        item['network'],    
-        categories,         
-        exchanges,          
-        slug,               
-        item.get('cid', ''),
-        circulating_supply, 
-        total_supply,       
-        max_supply,         
-        untracked_bool,     
-        ts                  
-    ]
+        row.error = f"{type(e).__name__}: {e}"
+
+    row.is_active = is_active == 1
+    return row
+
+# ==========================================
+# 📊 Google Sheets I/O
+# ==========================================
+def get_gspread_client():
+    creds_json = os.environ.get('GCP_CREDENTIALS')
+    if creds_json:
+        return gspread.service_account_from_dict(json.loads(creds_json))
+
+    if not os.path.exists('credentials.json'):
+        raise FileNotFoundError("ไม่พบไฟล์ credentials.json สำหรับรันบนเครื่อง Local")
+    return gspread.service_account(filename='credentials.json')
+
+def read_source(client):
+    """คืน list ของ (url, sheet_address) จากชีตต้นทาง"""
+    worksheet = client.open_by_key(SOURCE_SHEET_ID).worksheet(SOURCE_WORKSHEET)
+    urls = worksheet.get(SOURCE_URL_RANGE)
+    addresses = worksheet.get(SOURCE_ADDRESS_RANGE)
+
+    entries = []
+    for i, url in enumerate(urls):
+        url_val = url[0].strip() if url else ''
+        addr_val = addresses[i][0].strip() if i < len(addresses) and addresses[i] else ''
+        entries.append((url_val, addr_val))
+    return entries
+
+def drop_bad_urls(rows):
+    """ตัดแถวที่ URL ในชีตใช้ไม่ได้ออก (ยังขึ้น ERROR ใน log ไปแล้วตอนดึง)"""
+    return [r for r in rows if not r.bad_url]
+
+def can_write(title, rows):
+    """เช็กก่อนเขียนทับ: ถ้าแถว error เกิน MAX_ERROR_RATIO ไม่เขียน (กันข้อมูลดีถูกทับด้วยแถว error)"""
+    if not rows:
+        return False
+    failed = sum(1 for r in rows if r.error)
+    if failed / len(rows) > MAX_ERROR_RATIO:
+        report.fail("write", title, f"error {failed}/{len(rows)} ({failed / len(rows):.0%}) "
+                                    f"เกินเกณฑ์ {MAX_ERROR_RATIO:.0%} — ไม่เขียนทับ เก็บข้อมูลเดิมไว้")
+        return False
+    return True
+
+def write_worksheet(dest_sheet, title, header, rows):
+    """เขียนหัวคอลัมน์ที่แถว 1 + ข้อมูลตั้งแต่แถว 2 แล้วค่อยล้างแถวเก่าที่เหลือด้านล่าง
+
+    เขียนก่อนล้าง: ถ้าการเขียนพัง ข้อมูลเดิมยังอยู่ (ล้างเฉพาะคอลัมน์ A ถึงคอลัมน์สุดท้ายของ header)
+    """
+    needed_rows, needed_cols = len(rows) + 1, len(header)
+    try:
+        ws = dest_sheet.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = dest_sheet.add_worksheet(title=title, rows=max(1000, needed_rows), cols=needed_cols)
+    if ws.row_count < needed_rows:
+        ws.add_rows(needed_rows - ws.row_count)
+    if ws.col_count < needed_cols:
+        ws.add_cols(needed_cols - ws.col_count)
+
+    ws.update([header] + rows, "A1")
+    if ws.row_count > needed_rows:
+        last_col = gspread.utils.rowcol_to_a1(1, needed_cols).rstrip('0123456789')
+        ws.batch_clear([f"A{needed_rows + 1}:{last_col}"])
+    ws.freeze(rows=1)
+    report.info(f"เขียน [{title}] {len(rows)} แถว")
 
 # ==========================================
 # 🚀 Main Execution Cycle
 # ==========================================
+def record(stage, row, label):
+    if row.error:
+        report.fail(stage, label, row.error)
+    else:
+        report.ok(stage)
+
+def fetch_all(entries):
+    """ดึงข้อมูลทุก URL แบบขนาน คืน (dex_rows, currency_rows) ตามลำดับในชีต"""
+    jobs = [(i, url, addr) for i, (url, addr) in enumerate(entries) if url]
+    results = [None] * len(entries)
+
+    with report.progress("Fetching", len(jobs)) as advance, \
+            concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        futures = {executor.submit(process_any_url, url, addr): (i, url) for i, url, addr in jobs}
+        for future in concurrent.futures.as_completed(futures):
+            i, url = futures[future]
+            row = future.result()
+            results[i] = row
+            stage = "currency" if isinstance(row, CurrencyRow) else "dex"
+            label = url_label(url)
+            record(stage, row, label)
+            advance(label)
+
+    dex_rows = [r for r in results if isinstance(r, DexRow)]
+    currency_rows = [r for r in results if isinstance(r, CurrencyRow)]
+    return dex_rows, currency_rows
+
+def build_untracked_rows(dex_rows, currency_rows):
+    sources = [r for r in dex_rows + currency_rows if r.slug and str(r.slug).strip()]
+    pro_api_status = fetch_pro_api_status([r.slug for r in sources])
+
+    rows = []
+    with report.progress("Untracked", len(sources)) as advance, \
+            concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        for row in executor.map(lambda r: get_untracked_row(r, pro_api_status), sources):
+            if row:
+                record("untracked", row, row.slug)
+                rows.append(row)
+            advance(row.slug if row else "")
+    return rows
+
 def run_update_cycle():
-    start_time = datetime.now()
-    current_date = start_time.strftime("%d %B %Y")
-    print(f"\n{current_date} : 🚀 Starting Unified Update Cycle...")
-
+    """คืน True ถ้ารอบนี้จบโดยไม่มี error ร้ายแรง"""
     try:
-        scope = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive"
-        ]
-        
-        creds_json = os.environ.get('GCP_CREDENTIALS')
-        if creds_json:
-            print(f"{current_date} : ☁️ Running on Cloud/GitHub Actions...")
-            creds = json.loads(creds_json)
-        else:
-            print(f"{current_date} : 💻 Local environment detected. Loading from 'credentials.json'...")
-            try:
-                with open('credentials.json', 'r', encoding='utf-8') as file:
-                    creds = json.load(file)
-            except FileNotFoundError:
-                raise FileNotFoundError("⚠️ ไม่พบไฟล์ credentials.json สำหรับรันบนเครื่อง Local")
+        client = get_gspread_client()
 
-        credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds, scope)
-        client = gspread.authorize(credentials)
+        # 1. อ่าน
+        entries = read_source(client)
+        if not entries:
+            report.warn("ไม่พบ URL ในชีตต้นทาง")
+            return True
+        report.info(f"พบ {len(entries)} URL")
 
-        sheet = client.open_by_key("1fQGFO2fmf8wde6Sn9FeCrQK_9ehUujA7REoGBolCImA")
-        worksheet = sheet.worksheet("ETC")
-        urls = worksheet.get("D2:D")
-        addresses = worksheet.get("C2:C")
+        # 2. ประมวลผล
+        dex_rows, currency_rows = fetch_all(entries)
+        untracked_rows = build_untracked_rows(dex_rows, currency_rows)
 
-        if not urls:
-            print(f"{current_date} : ⚠️ No URLs found")
-            return
-
-        total_urls = len(urls)
-        print(f"{current_date} : 🔗 Found {total_urls} URLs total")
-
-        dex_results = [[""] * 14 for _ in range(total_urls)]
-        currency_results = [[""] * 26 for _ in range(total_urls)]
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            futures = {}
-            for i, url in enumerate(urls):
-                if url and len(url) > 0 and url[0].strip():
-                    sheet_addr = addresses[i][0].strip() if i < len(addresses) and addresses[i] and len(addresses[i]) > 0 else ''
-                    future = executor.submit(process_any_url, url[0].strip(), i+1, total_urls, sheet_addr)
-                    futures[future] = i 
-
-            for future in concurrent.futures.as_completed(futures):
-                original_index = futures[future]
-                result_type, result_data = future.result()
-                
-                if result_type == 'dex':
-                    dex_results[original_index] = result_data
-                elif result_type == 'currency':
-                    currency_results[original_index] = result_data
-
-        packed_dex = [row for row in dex_results if any(cell != "" for cell in row)]
-        packed_currency = [row for row in currency_results if any(cell != "" for cell in row)]
-
-        packed_currency_write = [row[:23] for row in packed_currency]
-
-        dest_sheet = client.open_by_key("1S3KXq6QdTep3RvR97LhURQ8sZzvTaVN1RJVxeWj3IXc")
-
-        # ---------------------------------------------------------
-        # ยกเลิกการเขียนชีท ETC ตามที่คุณสั่งแล้วครับ 🗑️
-        # ---------------------------------------------------------
-
-        # ---------------------------------------------------------
-        # 1. เขียนชีท MAIN
-        # ---------------------------------------------------------
-        if packed_currency_write:
-            try:
-                dest_ws_main = dest_sheet.worksheet("MAIN")
-            except:
-                dest_ws_main = dest_sheet.add_worksheet(title="MAIN", rows="1000", cols="26")
-            print(f"{current_date} : 🧹 Clearing old data in [MAIN]...")
-            dest_ws_main.batch_clear(["A2:Z"])
-            print(f"{current_date} : ✍️ Writing {len(packed_currency_write)} rows to [MAIN]...")
-            dest_ws_main.update("A2", packed_currency_write)
-
-        # ---------------------------------------------------------
-        # 2. ประมวลผลและเขียนชีท Untracked
-        # ---------------------------------------------------------
-        print(f"\n{current_date} : 🔍 Compiling data for [Untracked] check...")
-        
-        all_items = []
-        for row in packed_dex:
-            slug = row[6]
-            if slug and str(slug).strip() != "":
-                all_items.append({
-                    "name": row[0], "symbol": row[1], "address": row[2], 
-                    "network": row[3], "slug": slug, "cid": row[8] if len(row) > 8 else '',
-                    "circulating_supply": row[11], "total_supply": row[12], "max_supply": row[13],
-                    "type": "dex"
-                })
-        for row in packed_currency:
-            slug = row[8]
-            if slug and str(slug).strip() != "":
-                all_items.append({
-                    "name": row[0], "symbol": row[1], "address": row[2], 
-                    "network": row[3], "slug": slug, "cid": row[9],
-                    "tags": row[10], "exchanges": row[11], 
-                    "circulating_supply": row[23], "total_supply": row[24], "max_supply": row[25],
-                    "type": "currency"
-                })
-
-        pro_api_status = {}
-        if PRO_API_KEY and len(all_items) > 0:
-            print(f"{current_date} : 🌐 Fetching is_active from CMC Pro API...")
-            try:
-                valid_slugs = [i['slug'] for i in all_items if i['slug']]
-                chunked_slugs = [valid_slugs[i:i + 50] for i in range(0, len(valid_slugs), 50)]
-                for chunk in chunked_slugs:
-                    pro_url = f"https://pro-api.coinmarketcap.com/v3/cryptocurrency/quotes/latest?slug={','.join(chunk)}"
-                    pro_headers = {'X-CMC_PRO_API_KEY': PRO_API_KEY}
-                    
-                    res = requests.get(pro_url, headers=pro_headers)
-                    print_api_log(pro_url, res.status_code)
-                    
-                    data = res.json().get('data', {})
-                    for cid, info in data.items():
-                        slug_key = info.get('slug', '').lower()
-                        if slug_key:
-                            pro_api_status[slug_key] = info.get('is_active', 0)
-            except Exception as e:
-                print(f"⚠️ Pro API Error: {str(e)}")
-
-        print(f"{current_date} : ↻ Gathering Categories, Exchanges & Supply...")
-        untracked_results = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            futures = [executor.submit(get_untracked_row, item, pro_api_status) for item in all_items]
-            for future in futures:
-                result = future.result()
-                if result: 
-                    untracked_results.append(result)
-
-        if untracked_results:
-            try:
-                dest_ws_untracked = dest_sheet.worksheet("Untracked")
-            except:
-                dest_ws_untracked = dest_sheet.add_worksheet(title="Untracked", rows="1000", cols="15")
-
-            print(f"{current_date} : 🧹 Clearing old data in [Untracked]...")
-            dest_ws_untracked.batch_clear(["A2:Z"])
-            print(f"{current_date} : ✍️ Writing {len(untracked_results)} rows to [Untracked]...")
-            dest_ws_untracked.update("A2", untracked_results)
-
-        elapsed = datetime.now() - start_time
-        print(f"\n{current_date} : ✅ All Cycles Completed in {elapsed.total_seconds():.2f}s")
+        # 3. เขียน
+        dest_sheet = client.open_by_key(DEST_SHEET_ID)
+        ok = True
+        for title, cls, rows in ((DEST_MAIN_WORKSHEET, CurrencyRow, currency_rows),
+                                 (DEST_UNTRACKED_WORKSHEET, UntrackedRow, untracked_rows)):
+            rows = drop_bad_urls(rows)
+            if not rows:
+                continue
+            if can_write(title, rows):
+                write_worksheet(dest_sheet, title, cls.headers(), [r.to_row() for r in rows])
+            else:
+                ok = False
+        return ok
 
     except Exception as e:
-        print(f"{current_date} : ❌ Critical Error: {str(e)}")
-        print(traceback.format_exc())
+        report.fail("cycle", "Critical Error", str(e))
+        report.info(traceback.format_exc())
+        return False
 
 def main():
-    print("=== CMC Unified Auto-Updater (MAIN + Untracked) ===")
-    run_update_cycle()
+    # เปิดการใช้งาน ANSI Colors บน Windows Terminal
+    os.system('')
+    ok = run_update_cycle()
+    report.summary("CMC Unified Auto-Updater (MAIN + Untracked)")
+    sys.exit(0 if ok else 1)
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,48 @@
+name: DEX Scrape
+
+on:
+  schedule:
+    # 01:00 UTC = 08:00 น. เวลาไทย (หลัง UCID Update 1 ชม. จะได้ไม่ยิง CMC พร้อมกัน)
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# ใช้ group เดียวกันทั้ง 2 workflow: ไม่รันพร้อมกัน (รอบใหม่รอรอบเดิมเสร็จ) เพราะเขียนชีตเดียวกัน
+concurrency:
+  group: cmc-sheets
+  cancel-in-progress: false
+
+jobs:
+  run-updater:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run Tests
+        run: python -m pytest -q
+
+      - name: Run Script
+        env:
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+          CMC_PRO_API_KEY: ${{ secrets.CMC_PRO_API_KEY }}
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        run: python dex.py

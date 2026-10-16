@@ -4,7 +4,8 @@ import json
 import re
 import traceback
 import concurrent.futures
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import ClassVar
 from urllib.parse import urlparse
 
@@ -27,37 +28,124 @@ NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.
 # ==========================================
 # 📋 Row Model (ลำดับ field = ลำดับคอลัมน์ในแท็บ DEX)
 # ==========================================
+TIMEFRAMES = ("5m", "1h", "4h", "24h")
+
+
+@dataclass
+class TradeStats(SheetRow):
+    """สถิติการซื้อขายของ 1 ช่วงเวลา (จาก token.sts)"""
+    LABELS: ClassVar[dict] = {
+        'change_pct': "% Change", 'volume': "Volume (USD)", 'txs': "Txs",
+        'buys': "Buys", 'sells': "Sells", 'buy_volume': "Buy Volume (USD)",
+        'sell_volume': "Sell Volume (USD)", 'buyers': "Buyers", 'sellers': "Sellers",
+        'traders': "Traders",
+    }
+
+    change_pct: object = ""
+    volume: object = ""
+    txs: object = ""
+    buys: object = ""
+    sells: object = ""
+    buy_volume: object = ""
+    sell_volume: object = ""
+    buyers: object = ""
+    sellers: object = ""
+    traders: object = ""
+
+    @classmethod
+    def from_sts(cls, s):
+        return cls(
+            change_pct=to_number(s.get('pc')), volume=to_number(s.get('vu')),
+            txs=to_number(s.get('txs')), buys=to_number(s.get('nb')), sells=to_number(s.get('ns')),
+            buy_volume=to_number(s.get('bvu')), sell_volume=to_number(s.get('svu')),
+            buyers=to_number(s.get('but')), sellers=to_number(s.get('sut')),
+            traders=to_number(s.get('ut')),
+        )
+
+
+def stats_field(tf):
+    return field(default_factory=TradeStats, metadata={'prefix': f"{tf} "})
+
+
 @dataclass
 class DexTokenRow(SheetRow):
     LABELS: ClassVar[dict] = {
-        'name': "Name", 'symbol': "Symbol", 'network': "Network", 'address': "Address",
+        # ข้อมูลโปรเจกต์
+        'name': "Name", 'symbol': "Symbol", 'chain': "Chain", 'network': "Network",
+        'address': "Address", 'decimals': "Decimals", 'creator': "Creator",
+        'website': "Website", 'twitter': "Twitter", 'telegram': "Telegram", 'logo': "Logo",
+        'created_at': "Created At (UTC)", 'launched_at': "Launched At (UTC)",
+        # ราคา / มูลค่า
         'price_usd': "Price (USD)", 'high_24h': "High 24h", 'low_24h': "Low 24h",
-        'price_change_24h': "% Change 24h", 'volume_24h': "Volume 24h (USD)", 'txs_24h': "Txs 24h",
-        'liquidity_usd': "Liquidity (USD)", 'market_cap': "Market Cap",
+        'liquidity_usd': "Liquidity (USD)", 'market_cap': "Market Cap", 'fdv': "FDV",
         'circulating_supply': "Circulating Supply", 'total_supply': "Total Supply",
-        'max_supply': "Max Supply", 'holders': "Holders", 'security': "Security",
-        'top_pool': "Top Pool", 'cmc_slug': "CMC Slug", 'cmc_id': "CMC ID", 'url': "URL",
-        'updated_at': "Updated At",
+        'max_supply': "Max Supply", 'self_reported_supply': "Self-reported Supply",
+        'holders': "Holders",
+        # pool / CEX
+        'pool_count': "Pools", 'pool_dexes': "Pool DEXes", 'pools': "Pools Detail",
+        'top_pool': "Top Pool", 'top_pool_liquidity': "Top Pool Liquidity (USD)",
+        'cex_count': "CEX Count", 'cex_spot': "CEX (Spot)", 'cex_derivatives': "CEX (Derivatives)",
+        # ความปลอดภัย
+        'security': "Security", 'honeypot': "Honeypot", 'unverified_contract': "Unverified Contract",
+        'mintable': "Mintable", 'freezable': "Freezable", 'rug_pull': "Rug Pull",
+        'fake_token': "Fake Token", 'buy_tax': "Buy Tax", 'sell_tax': "Sell Tax",
+        'pump_status': "Pump Status",
+        # อ้างอิง
+        'cmc_slug': "CMC Slug", 'cmc_id': "CMC ID", 'url': "URL", 'updated_at': "Updated At",
     }
 
+    # ข้อมูลโปรเจกต์
     name: str = ""
     symbol: str = ""
+    chain: str = ""
     network: str = ""
     address: str = ""
+    decimals: object = ""
+    creator: str = ""
+    website: str = ""
+    twitter: str = ""
+    telegram: str = ""
+    logo: str = ""
+    created_at: str = ""
+    launched_at: str = ""
+    # ราคา / มูลค่า
     price_usd: object = ""
     high_24h: object = ""
     low_24h: object = ""
-    price_change_24h: object = ""
-    volume_24h: object = ""
-    txs_24h: object = ""
     liquidity_usd: object = ""
     market_cap: object = ""
+    fdv: object = ""
     circulating_supply: object = ""
     total_supply: object = ""
     max_supply: object = ""
+    self_reported_supply: object = ""
     holders: object = ""
-    security: str = ""
+    # การซื้อขายแยกช่วงเวลา (คอลัมน์ละ 10 ค่า × 4 ช่วง)
+    stats_5m: TradeStats = stats_field("5m")
+    stats_1h: TradeStats = stats_field("1h")
+    stats_4h: TradeStats = stats_field("4h")
+    stats_24h: TradeStats = stats_field("24h")
+    # pool / CEX (รายการรวมเป็นข้อความเดียว)
+    pool_count: object = ""
+    pool_dexes: str = ""
+    pools: str = ""
     top_pool: str = ""
+    top_pool_liquidity: object = ""
+    cex_count: object = ""
+    cex_spot: str = ""
+    cex_derivatives: str = ""
+    # ความปลอดภัย (EVM: honeypot/unverified, Solana: mintable/freezable)
+    security: str = ""
+    honeypot: str = ""
+    unverified_contract: str = ""
+    mintable: str = ""
+    freezable: str = ""
+    rug_pull: str = ""
+    fake_token: str = ""
+    buy_tax: object = ""
+    sell_tax: object = ""
+    pump_status: str = ""
+    # อ้างอิง
     cmc_slug: str = ""
     cmc_id: object = ""
     url: str = ""
@@ -77,6 +165,17 @@ def to_number(val):
     except (TypeError, ValueError):
         return ""
 
+def ms_to_utc(ms):
+    """timestamp มิลลิวินาที → 'YYYY-MM-DD HH:MM' (UTC)"""
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return ""
+
+def join(values):
+    """รวมรายการเป็นข้อความเดียว ตัดตัวซ้ำ คงลำดับเดิม"""
+    return ", ".join(dict.fromkeys(v for v in values if v))
+
 def find_query(queries, key):
     """หา data ของ react-query ตามชื่อ queryKey[0]"""
     for q in queries:
@@ -84,6 +183,13 @@ def find_query(queries, key):
         if query_key and query_key[0] == key:
             return (q.get('state') or {}).get('data') or {}
     return {}
+
+def describe_pool(pool):
+    """'ORBIO/USDG · Uniswap v4 (Robinhood) · $1,019,936'"""
+    pair = "/".join(((pool.get(t) or {}).get('sym') or '?') for t in ('t1', 't0'))
+    liq = to_number(pool.get('liqUsd'))
+    liq_text = f"${liq:,.0f}" if liq != "" else "-"
+    return f"{pair} · {pool.get('exn') or '?'} · {liq_text}"
 
 def parse_dex_page(html, url, ts):
     match = NEXT_DATA_RE.search(html)
@@ -100,28 +206,64 @@ def parse_dex_page(html, url, ts):
         return DexTokenRow(name="Scrape Failed", url=url, updated_at=ts, error="ไม่พบข้อมูล token ใน __NEXT_DATA__")
 
     supply = find_query(queries, 'dex-token-all-networks-info')
-    stats_24h = next((s for s in token.get('sts') or [] if s.get('tp') == '24h'), {})
-    pools = token.get('pls') or []
+    security = find_query(queries, 'dex-token-security-info')
+    display = security.get('evmDisplay') or security.get('solanaDisplay') or {}
+    extra = security.get('extra') or {}
+    stats = {s.get('tp'): s for s in token.get('sts') or []}
+
+    pools = sorted(token.get('pls') or [], key=lambda p: to_number(p.get('liqUsd')) or 0, reverse=True)
+    cexs = token.get('cexs') or []
+
+    price = to_number(token.get('p'))
+    total_supply = to_number(supply.get('totalSupply') or token.get('ts'))
 
     return DexTokenRow(
-        name=token.get('n', ''),
-        symbol=token.get('sym', ''),
-        network=token.get('pdex', ''),
-        address=token.get('addr', ''),
-        price_usd=to_number(token.get('p')),
+        name=token.get('n') or '',
+        symbol=token.get('sym') or '',
+        chain=token.get('plt') or '',
+        network=token.get('pdex') or '',
+        address=token.get('addr') or '',
+        decimals=to_number(token.get('dec')),
+        creator=token.get('crt') or '',
+        website=token.get('web') or '',
+        twitter=token.get('tw') or '',
+        telegram=token.get('tg') or '',
+        logo=token.get('lg') or '',
+        created_at=ms_to_utc(token.get('pubAt')),
+        launched_at=ms_to_utc(token.get('lchAt')),
+        price_usd=price,
         high_24h=to_number(token.get('ph24h')),
         low_24h=to_number(token.get('pl24h')),
-        price_change_24h=to_number(stats_24h.get('pc')),
-        volume_24h=to_number(stats_24h.get('vu')),
-        txs_24h=to_number(stats_24h.get('txs')),
         liquidity_usd=to_number(token.get('liqUsd')),
         market_cap=to_number(token.get('mcap')),
+        fdv=price * total_supply if price != "" and total_supply != "" else "",
         circulating_supply=to_number(supply.get('circulatingSupply') or token.get('ltcs')),
-        total_supply=to_number(supply.get('totalSupply') or token.get('ts')),
+        total_supply=total_supply,
         max_supply=to_number(supply.get('maxSupply')),
+        self_reported_supply=to_number(supply.get('selfReportedCirculatingSupply')),
         holders=to_number(props.get('holdersCount')),
-        security=token.get('rl', ''),
+        stats_5m=TradeStats.from_sts(stats.get('5m') or {}),
+        stats_1h=TradeStats.from_sts(stats.get('1h') or {}),
+        stats_4h=TradeStats.from_sts(stats.get('4h') or {}),
+        stats_24h=TradeStats.from_sts(stats.get('24h') or {}),
+        pool_count=len(pools) if pools else "",
+        pool_dexes=join(p.get('exn') for p in pools),
+        pools=" | ".join(describe_pool(p) for p in pools),
         top_pool=pools[0].get('addr', '') if pools else '',
+        top_pool_liquidity=to_number(pools[0].get('liqUsd')) if pools else '',
+        cex_count=len(cexs) if cexs else "",
+        cex_spot=join(c.get('n') for c in cexs if 'SPOT' in (c.get('cat') or [])),
+        cex_derivatives=join(c.get('n') for c in cexs if 'DERIVATIVES' in (c.get('cat') or [])),
+        security=token.get('rl') or '',
+        honeypot=display.get('honeypotStatus') or '',
+        unverified_contract=display.get('unverifiedContractStatus') or '',
+        mintable=display.get('mintableStatus') or '',
+        freezable=display.get('freezableStatus') or '',
+        rug_pull=display.get('rugPullStatus') or '',
+        fake_token=display.get('fakeTokenStatus') or '',
+        buy_tax=to_number(extra.get('buyTax')),
+        sell_tax=to_number(extra.get('sellTax')),
+        pump_status=token.get('pshr') or '',
         cmc_slug=token.get('cslug') or '',
         cmc_id=token.get('cid') or '',  # 0 = ไม่มีใน CMC → เว้นว่าง
         url=url,

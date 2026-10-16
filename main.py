@@ -33,7 +33,7 @@ SOURCE_ADDRESS_RANGE = "G2:G"
 # 📤 ชีตปลายทาง
 DEST_SHEET_ID = "1S3KXq6QdTep3RvR97LhURQ8sZzvTaVN1RJVxeWj3IXc"
 DEST_MAIN_WORKSHEET = "CEX"
-DEST_UNTRACKED_WORKSHEET = "Untracked"
+DEST_REGISTRY_WORKSHEET = "Token Registry"
 
 HEADERS = {'User-Agent': 'Mozilla/5.0'}
 
@@ -58,7 +58,7 @@ class SheetRow:
 
     - field ที่ metadata col=False ไม่ถูกเขียนลงชีต
     - field ที่เป็น SheetRow ซ้อนอยู่ จะถูกกระจายเป็นหลายคอลัมน์
-    - หัวคอลัมน์มาจาก LABELS (ถ้าไม่มี ใช้ชื่อ field)
+    - หัวคอลัมน์มาจาก LABELS (ถ้าไม่มี ใช้ชื่อ field) — field ซ้อนใส่ metadata prefix ได้
     error: เหตุผลที่ดึงข้อมูลไม่สำเร็จ ใช้นับใน report
     """
     LABELS: ClassVar[dict] = {}
@@ -81,7 +81,11 @@ class SheetRow:
         out = []
         for f in cls._columns():
             nested = cls._nested(f)
-            out.extend(nested.headers() if nested else [cls.LABELS.get(f.name, f.name)])
+            if nested:
+                prefix = f.metadata.get('prefix', '')  # เช่น "24h " → "24h Volume"
+                out.extend(prefix + h for h in nested.headers())
+            else:
+                out.append(cls.LABELS.get(f.name, f.name))
         return out
 
     def to_row(self):
@@ -120,7 +124,7 @@ class OhlcSummary(SheetRow):
 
 @dataclass
 class DexRow(SheetRow):
-    """ข้อมูลจากหน้า DEX (ไม่ได้เขียนลงชีต ใช้เป็นต้นทางของ Untracked)"""
+    """ข้อมูลจากหน้า DEX (ไม่ได้เขียนลงชีต ใช้เป็นต้นทางของ Token Registry)"""
     name: str = ""
     symbol: str = ""
     address: str = ""
@@ -139,7 +143,7 @@ class DexRow(SheetRow):
 
 @dataclass
 class CurrencyRow(SheetRow):
-    """1 แถวของชีต CEX (supply ไม่ถูกเขียนลงชีต ใช้ส่งต่อให้ Untracked)"""
+    """1 แถวของชีต CEX (supply ไม่ถูกเขียนลงชีต ใช้ส่งต่อให้ Token Registry)"""
     LABELS: ClassVar[dict] = {
         'name': "Name", 'symbol': "Symbol", 'address': "Address", 'network': "Network",
         'open_yesterday': "Open (เมื่อวาน)", 'high_yesterday': "High (เมื่อวาน)",
@@ -168,8 +172,8 @@ class CurrencyRow(SheetRow):
 
 
 @dataclass
-class UntrackedRow(SheetRow):
-    """1 แถวของชีต Untracked"""
+class RegistryRow(SheetRow):
+    """1 แถวของชีต Token Registry"""
     LABELS: ClassVar[dict] = {
         'name': "Name", 'symbol': "Symbol", 'address': "Address", 'network': "Network",
         'categories': "Categories", 'exchanges': "Exchanges", 'slug': "Slug", 'cid': "CMC ID",
@@ -360,7 +364,7 @@ def fetch_historical_ohlc(cid, date_added_str):
         return OhlcSummary(), f"ohlc: {type(e).__name__}: {e}"
 
 # ==========================================
-# 🌐 Processing Logic (DEX & Currencies & Untracked)
+# 🌐 Processing Logic (DEX & Currencies & Token Registry)
 # ==========================================
 def parse_dex_html(html, ts):
     def text(regex):
@@ -515,11 +519,11 @@ def fetch_pro_api_status(slugs):
             report.warn(f"Pro API (slug ที่ {i + 1}-{i + len(chunk)}): {type(e).__name__}: {e}")
     return status
 
-def get_untracked_row(source_row, pro_api_status):
+def get_registry_row(source_row, pro_api_status):
     if not source_row.slug:
         return None
 
-    row = UntrackedRow.from_source(source_row)
+    row = RegistryRow.from_source(source_row)
     row.updated_at = now_ts()
     slug_lower = row.slug.lower()
     is_active = 0
@@ -652,16 +656,16 @@ def fetch_all(entries):
     currency_rows = [r for r in results if isinstance(r, CurrencyRow)]
     return dex_rows, currency_rows
 
-def build_untracked_rows(dex_rows, currency_rows):
+def build_registry_rows(dex_rows, currency_rows):
     sources = [r for r in dex_rows + currency_rows if r.slug and str(r.slug).strip()]
     pro_api_status = fetch_pro_api_status([r.slug for r in sources])
 
     rows = []
-    with report.progress("Untracked", len(sources)) as advance, \
+    with report.progress("Registry", len(sources)) as advance, \
             concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        for row in executor.map(lambda r: get_untracked_row(r, pro_api_status), sources):
+        for row in executor.map(lambda r: get_registry_row(r, pro_api_status), sources):
             if row:
-                record("untracked", row, row.slug)
+                record("registry", row, row.slug)
                 rows.append(row)
             advance(row.slug if row else "")
     return rows
@@ -680,13 +684,13 @@ def run_update_cycle():
 
         # 2. ประมวลผล
         dex_rows, currency_rows = fetch_all(entries)
-        untracked_rows = build_untracked_rows(dex_rows, currency_rows)
+        registry_rows = build_registry_rows(dex_rows, currency_rows)
 
         # 3. เขียน
         dest_sheet = client.open_by_key(DEST_SHEET_ID)
         ok = True
         for title, cls, rows in ((DEST_MAIN_WORKSHEET, CurrencyRow, currency_rows),
-                                 (DEST_UNTRACKED_WORKSHEET, UntrackedRow, untracked_rows)):
+                                 (DEST_REGISTRY_WORKSHEET, RegistryRow, registry_rows)):
             rows = drop_bad_urls(rows)
             if not rows:
                 continue
@@ -705,7 +709,7 @@ def main():
     # เปิดการใช้งาน ANSI Colors บน Windows Terminal
     os.system('')
     ok = run_update_cycle()
-    report.summary("CMC Unified Auto-Updater (MAIN + Untracked)")
+    report.summary("CMC Unified Auto-Updater (CEX + Token Registry)")
     sys.exit(0 if ok else 1)
 
 if __name__ == "__main__":

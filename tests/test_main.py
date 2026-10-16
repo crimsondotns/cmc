@@ -2,7 +2,7 @@ import json
 
 import main
 from main import (
-    CurrencyRow, DexRow, OhlcSummary, UntrackedRow,
+    CurrencyRow, DexRow, OhlcSummary, RegistryRow,
     build_currency_row, get_slug_from_url, parse_dex_html, safe_float,
     summarize_ohlc, unique_exchange_names, format_short_date,
 )
@@ -86,19 +86,19 @@ def test_parse_dex_html_failure():
     assert parse_dex_html("<html></html>", "TS").name == "Scrape Failed"
 
 
-def test_untracked_row_from_currency_and_dex():
+def test_registry_row_from_currency_and_dex():
     cur = CurrencyRow(name="A", symbol="A", address="x", network="n", slug="a", cid=1,
                       tags="t", exchanges="e", circulating_supply=1, total_supply=2, max_supply=3)
-    u = UntrackedRow.from_source(cur)
+    u = RegistryRow.from_source(cur)
     u.is_active, u.updated_at = True, "TS"
     assert u.to_row() == ["A", "A", "x", "n", "t", "e", "a", 1, 1, 2, 3, True, "TS"]
 
     dex = DexRow(name="D", slug="d")
-    assert (UntrackedRow.from_source(dex).categories, UntrackedRow.from_source(dex).exchanges) == ("", "")
+    assert (RegistryRow.from_source(dex).categories, RegistryRow.from_source(dex).exchanges) == ("", "")
 
 
-def test_get_untracked_row_skips_missing_slug():
-    assert main.get_untracked_row(DexRow(name="x"), {}) is None
+def test_get_registry_row_skips_missing_slug():
+    assert main.get_registry_row(DexRow(name="x"), {}) is None
 
 
 def test_format_thai_duration():
@@ -154,7 +154,7 @@ def test_process_dex_url_recovers_on_retry(monkeypatch):
 def test_headers_match_row_length():
     assert len(CurrencyRow.headers()) == len(CurrencyRow().to_row()) == 23
     assert CurrencyRow.headers()[12] == "ATH Open" and CurrencyRow.headers()[-1] == "Updated At"
-    assert len(UntrackedRow.headers()) == len(UntrackedRow().to_row()) == 13
+    assert len(RegistryRow.headers()) == len(RegistryRow().to_row()) == 13
     assert "error" not in CurrencyRow.headers()
 
 
@@ -275,6 +275,6 @@ def test_bad_url_rows_are_dropped_before_write():
     assert "bad_url" not in CurrencyRow.headers()
 
 
-def test_untracked_cmc_id_blank_when_dex_cid_zero():
+def test_registry_cmc_id_blank_when_dex_cid_zero():
     row = parse_dex_html('{"n":"X","sym":"X","cid": 0}', "TS")
-    assert row.cid == "" and UntrackedRow.from_source(row).to_row()[7] == ""
+    assert row.cid == "" and RegistryRow.from_source(row).to_row()[7] == ""

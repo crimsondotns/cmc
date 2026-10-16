@@ -23,7 +23,7 @@
 | แท็บ | เนื้อหา |
 |---|---|
 | `CEX` | 1 แถวต่อ URL หน้าเหรียญ, 23 คอลัมน์ (ดู `CurrencyRow` ใน `main.py`) |
-| `Untracked` | ทุกรายการที่มี slug ทั้งหน้าเหรียญและ DEX, 13 คอลัมน์ (ดู `UntrackedRow`) |
+| `Token Registry` | ทุกรายการที่มี slug ทั้งหน้าเหรียญและ DEX, 13 คอลัมน์ (ดู `RegistryRow`) |
 
 ลำดับคอลัมน์ในชีตเท่ากับลำดับ field ใน dataclass — ถ้าจะเพิ่ม/สลับคอลัมน์ ให้แก้ที่ dataclass
 
@@ -33,9 +33,13 @@ ID ชีต, ชื่อแท็บ และช่วงเซลล์ ต�
 
 สคริปต์แยก (workflow `DEX Scrape`) — เลือกเฉพาะ URL ของ `dex.coinmarketcap.com` จากคอลัมน์ I แท็บ `CoinmarketCap`
 อ่านข้อมูลจาก JSON `__NEXT_DATA__` ในหน้าเว็บ แล้วเขียนลงแท็บ `DEX` ของชีตปลายทาง 1 แถวต่อ URL
-— คอลัมน์ดู `DexTokenRow` ใน `dex.py`:
-ชื่อ, symbol, network, address, ราคา, high/low/%เปลี่ยน/volume/จำนวน tx 24h, liquidity, market cap,
-supply, holders, ระดับความปลอดภัย, pool หลัก, CMC slug/id, URL, เวลาอัปเดต
+— 86 คอลัมน์ (ดู `DexTokenRow` ใน `dex.py`):
+- ข้อมูลโปรเจกต์: ชื่อ, symbol, chain, network, address, decimals, creator, เว็บ, Twitter, Telegram, โลโก้, วันที่สร้าง/launch (UTC)
+- ราคา/มูลค่า: ราคา, high/low 24h, liquidity, market cap, FDV, supply (รวม self-reported), holders
+- การซื้อขายแยก 5m / 1h / 4h / 24h: % เปลี่ยน, volume, txs, จำนวนซื้อ/ขาย, volume ซื้อ/ขาย, จำนวนคนซื้อ/ขาย, traders
+- pool (รวมเป็นข้อความ เรียงตาม liquidity), CEX ที่ list แยก Spot/Derivatives
+- ความปลอดภัย: honeypot, unverified, mintable, freezable, rug pull, fake token, buy/sell tax, pump status
+- CMC slug/id, URL, เวลาอัปเดต
 
 ```bash
 python dex.py
